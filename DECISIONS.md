@@ -1,242 +1,179 @@
+
 # Vikmo DealerDesk — Technical Decisions
 
 ## 1. Backend Architecture
 
-- **Framework:** Django with Django REST Framework (DRF).
-- **Database:** PostgreSQL, configured through environment variables.
-- **API design:** REST endpoints expose product catalogue, inventory, dealer, order, assistant, and forecasting functionality.
-- **Validation:** Incoming API data should be validated before database writes, using the project's serializers and validation logic.
-- **Error handling:** API errors should follow the response formats defined in `API_CONTRACT.md` so clients can handle failures consistently.
-- **Separation of concerns:** Business operations, database access, assistant orchestration, and forecasting should remain separated so that each can be tested and maintained independently.
+The application uses Django and Django REST Framework to expose APIs for the dealer inventory and ordering workflow. Django provides a structured backend, ORM-based database access, request validation, and a maintainable way to separate business logic from API views.
 
-**Rationale:** Django and DRF provide a structured foundation for data-backed APIs, request validation, database integration, and reusable business logic.
+Business rules are kept in backend services rather than relying on frontend calculations. This allows inventory checks, forecast generation, and reorder suggestions to be reused consistently by API endpoints and other backend components.
 
-**Implementation evidence to add:** The actual settings, serializer, view, and service file paths and line ranges.
+The AI/ML track integrates the assistant, inventory data, forecasting, and reorder suggestions into the existing application instead of maintaining separate, disconnected implementations.
 
 ## 2. Data Management and Order Integrity
 
-- Product catalogue and dealer records are loaded from the provided data files through the `seed_data` management command.
-- The seed operation is intended to be idempotent: repeated runs should not create duplicate seeded products or dealers.
-- Product SKUs and dealer codes are used as identifiers.
-- Order creation uses catalogue prices at the time of order creation and creates orders with `DRAFT` status.
-- Inventory changes should be made through the inventory API or corresponding business logic rather than by relying on language-model-generated values.
-- Order totals and line-item prices should be calculated or validated by the application using trusted catalogue data.
+Inventory and product information are treated as the source of truth for stock availability and pricing. The assistant must not invent product prices, SKU details, or stock quantities.
 
-**Rationale:** The application database is the source of truth for catalogue, stock, and pricing information. This reduces inconsistencies between assistant responses and actual business records.
+Order creation follows a draft-first approach. The assistant can prepare a draft order, but the draft is not equivalent to a confirmed or fulfilled order. This reduces the risk of unintended purchasing actions and gives the user an opportunity to review the details before proceeding.
 
-**Verification required:** Confirm the actual unique constraints, seed implementation, order-price snapshot behavior, and inventory update rules in the source code.
+Database operations should validate product identifiers and quantities before persisting order data. Invalid SKUs, unavailable products, and invalid quantities should produce clear errors instead of silently creating incorrect records.
+
+Seed operations should be repeatable without duplicating the same baseline data. Environment-specific secrets must remain outside version control, while `.env.example` documents the required configuration using placeholders.
 
 ## 3. AI Assistant Architecture and Tool Calling
 
-The assistant uses Groq as its language-model provider and supports tool-based interaction with DealerDesk operations.
+The assistant uses tool calling to interact with application data and business operations. Instead of asking the language model to guess inventory details or perform database operations directly, the application exposes narrowly defined tools.
 
-The available tools are:
+The principal tools are:
 
-- `search_parts` — search the parts catalogue.
-- `check_stock` — retrieve current inventory information.
-- `create_draft_order` — create a draft order through the application.
+- `search_parts`: searches for relevant parts using the available catalogue.
+- `check_stock`: retrieves current stock information for the requested items.
+- `create_draft_order`: creates a draft order after the necessary details have been collected and validated.
 
-### Tool-calling flow
+The model is responsible for understanding the user's request, deciding which tool is relevant, collecting missing information, and presenting the results clearly. The backend remains responsible for retrieving authoritative data and enforcing business rules.
 
-1. Receive the user's message and relevant conversation context.
-2. Send the message to the configured language model with the available tool definitions.
-3. If the model requests a tool, validate and execute the request through the corresponding application function.
-4. Return the tool result to the model in the format required by the provider.
-5. Allow the model to formulate a response using the returned data, or execute another supported tool if needed.
-6. Return the final response to the user.
-
-The actual implementation should enforce a bounded tool-execution loop and handle invalid arguments, tool failures, and provider errors.
-
-**Rationale:** Tool calling lets the language model interpret user intent while application functions perform data retrieval and state-changing operations.
-
-**Implementation evidence to add:** The assistant endpoint, model request, tool dispatcher, tool implementations, and session-history logic, with exact line references.
+Tool calls should be executed only when appropriate for the user's request. The assistant should use returned tool results rather than inventing successful operations or presenting unverified results as completed actions.
 
 ## 4. Data Grounding, Clarification, and Conversation Context
 
-- Product names, prices, and stock quantities should be retrieved from application data rather than invented by the model.
-- The assistant should request clarification when essential order details are missing or ambiguous.
-- A draft order should only be created when the required information is available and the requested operation passes application validation.
-- Conversation history should be scoped to the intended session so that unrelated users or sessions do not share context.
-- Previous conversation text must not override current database state when reporting prices or inventory.
-- The assistant should remain within supported DealerDesk operations and respond appropriately to unrelated requests.
+The assistant should answer inventory and pricing questions using retrieved application data. If the available information is insufficient, it should explain the limitation or ask a clarification question rather than fabricate an answer.
 
-**Rationale:** Grounding factual responses in the database and validating actions in application code improves reliability and prevents the language model from becoming the authority for business-critical values.
+For order-related requests, the assistant should collect the required details before creating a draft. These may include the requested part, SKU, quantity, and any other fields required by the backend contract.
 
-**Verification required:** Confirm the exact session mechanism, clarification behavior, authorization checks, and off-topic handling implemented by the current code.
+Conversation context should be used to resolve relevant follow-up messages. For example, if the user specifies a quantity after discussing a particular part, the assistant should retain the relevant context when it is unambiguous. If multiple interpretations remain possible, it should ask the user to clarify.
+
+The assistant should remain focused on the dealer inventory and ordering use case. Unrelated requests should not trigger inventory operations or draft-order creation.
 
 ## 5. Prompt Injection and Security Boundaries
 
-Product descriptions, catalogue fields, retrieved documents, and user messages must be treated as untrusted input.
+Catalogue descriptions, product names, retrieved documents, and other external data must be treated as data, not as instructions that can override the assistant's rules.
 
-- Catalogue content should be treated as data, not as instructions that can change the assistant's operating rules.
-- The model should not be permitted to invent additional tools or perform unsupported operations.
-- Tool arguments should be validated by application code.
-- Stock changes and order creation should be subject to business rules enforced outside the model.
-- The assistant should create draft orders rather than directly confirming or fulfilling orders.
-- Secrets such as API keys and database credentials should be read from environment configuration and excluded from version control.
-- `.env.example` should contain placeholders rather than real credentials.
-- Errors should not expose credentials or unnecessary internal information.
+The assistant must not follow instructions embedded in catalogue content that attempt to change its role, disclose secrets, bypass validation, or trigger unauthorized actions.
 
-**Rationale:** Prompt instructions alone are not a sufficient security boundary. Application-level validation, restricted tool access, and controlled database operations are required.
+Security-sensitive operations must be enforced by the backend rather than by relying only on the language model's instructions. Tool inputs should be validated, and database access should be restricted to the operations required by each tool.
 
-**Verification required:** Confirm that these protections are actually implemented and tested. Do not claim resistance to every prompt-injection attack without evidence.
+The application should not expose API keys, credentials, environment variables, or other secrets in model prompts, user-facing responses, logs, or committed configuration files.
 
 ## 6. Demand Forecasting Approach
 
-The project generates weekly SKU-level forecasts in `ml/forecast.csv`.
+The forecasting workflow uses historical sales data from `ml/sales_history.csv` and the forecast input data from `ml/forecast.csv`.
 
-The expected output contains:
+The current baseline forecasting implementation is based on the mean of the most recent 12 available historical observations for each SKU. The generated value is rounded to an integer, constrained to be non-negative, and used for the four forecast weeks.
 
-- `sku`
-- `week_start`
-- `forecast_units`
+This approach provides a simple and reproducible baseline that can be evaluated against other forecasting methods. It does not require a complex model to be trained before the application can produce a forecast.
 
-The current output has been validated to contain 160 rows, representing 40 SKUs over four forecast weeks, with non-negative forecast values.
+Three methods were considered during historical evaluation:
 
-The current generator uses recent historical sales observations to calculate a per-SKU average and produces forecasts for the configured weeks. See `core/management/commands/generate_forecast.py` for the implementation.
+1. **Last-value baseline:** uses the latest observed sales quantity.
+2. **Recent-average baseline:** uses the mean of the most recent 12 observations available at the forecast origin.
+3. **Same-week-last-year baseline:** uses the historical observation corresponding to the same seasonal week, when available.
 
-### Forecasting baselines
+The recent-average baseline performed best on the common historical evaluation set described in Section 7. This supports using it as the current baseline, but it does not establish that it will be the best method for every SKU or business condition.
 
-The historical backtest compares three methods:
-
-1. **Last value:** Use the most recently observed weekly demand.
-2. **12-observation average:** Use the average of the previous 12 weekly observations.
-3. **Same week last year:** Use the observation 52 weeks before the target week.
-
-These provide simple reference points for evaluating whether a forecasting approach improves on straightforward historical baselines.
-
-**Rationale:** Baselines are easy to interpret and establish a reproducible comparison before introducing more complex forecasting models.
+Known promotions, festival demand such as Diwali, intermittent sales, and new SKUs require additional evaluation. The current baseline does not explicitly model these effects.
 
 ## 7. Historical Backtest and Evaluation Results
 
-The rolling-origin four-week backtest produced the following results:
+The forecasting methods were compared using a rolling-origin historical backtest. Each forecast origin used only observations available before that origin, and the predictions were compared with subsequent actual sales.
 
-| Method | MAE | WAPE |
-|---|---:|---:|
-| Last value | 13.583 | 38.22% |
-| 12-observation average | 10.998 | 30.95% |
-| Same week last year | 12.686 | 35.70% |
+The common evaluation set required at least 52 prior weekly observations and four subsequent actual observations. The evaluation covered 1,862 forecast origins and four forecast horizons, producing 7,448 predictions per method.
 
-Evaluation details:
+### Overall results
 
-- **Forecast origins:** 1,862.
-- **Forecast horizons:** Four weeks.
-- **Predictions per method:** 7,448.
-- **Evaluation set:** The same eligible forecast origins for all three methods.
-- **History requirement:** 52 prior weekly observations and four subsequent actual observations.
+| Method | MAE | WAPE | Predictions |
+|---|---:|---:|---:|
+| Last value | 13.583 | 38.22% | 7,448 |
+| 12-observation average | 10.998 | 30.95% | 7,448 |
+| Same week last year | 12.686 | 35.70% | 7,448 |
 
-The 12-observation average achieved the lowest overall MAE and WAPE among the three evaluated methods. Its MAE was approximately 19.0% lower than the last-value baseline.
+MAE is the mean absolute error between predicted and actual quantities. Lower MAE indicates smaller average absolute prediction errors.
 
-The results support choosing the 12-observation average among these tested baselines on this historical dataset. They do not establish that it is optimal for every SKU or future period.
+WAPE is the sum of absolute errors divided by the sum of actual quantities, expressed as a percentage. Lower WAPE indicates a smaller aggregate absolute error relative to actual demand.
 
-The backtest can be reproduced with:
+On this evaluation set, the 12-observation average achieved the lowest MAE and WAPE among the three methods. Its MAE was approximately 19% lower than the last-value baseline.
 
-```bash
-python ml/backtest_four_week.py
-```
+### Results by forecast horizon
 
-### Evaluation limitations
+| Horizon | Method | MAE | WAPE | Predictions |
+|---|---|---:|---:|---:|
+| Week 1 | Last value | 13.412 | 37.18% | 1,862 |
+| Week 1 | 12-observation average | 11.096 | 30.76% | 1,862 |
+| Week 1 | Same week last year | 12.719 | 35.26% | 1,862 |
+| Week 2 | Last value | 13.259 | 37.00% | 1,862 |
+| Week 2 | 12-observation average | 11.169 | 31.16% | 1,862 |
+| Week 2 | Same week last year | 12.779 | 35.65% | 1,862 |
+| Week 3 | Last value | 14.054 | 39.70% | 1,862 |
+| Week 3 | 12-observation average | 11.027 | 31.15% | 1,862 |
+| Week 3 | Same week last year | 12.660 | 35.76% | 1,862 |
+| Week 4 | Last value | 13.605 | 39.05% | 1,862 |
+| Week 4 | 12-observation average | 10.699 | 30.71% | 1,862 |
+| Week 4 | Same week last year | 12.589 | 36.13% | 1,862 |
 
-- The backtest measures performance on the available historical data; it does not guarantee future accuracy.
-- Promotions and Diwali-related demand changes have not been independently validated by the reported aggregate metrics.
-- New SKUs with insufficient history require a separately defined cold-start strategy.
-- Intermittent-demand SKUs may not be well represented by a simple moving average.
-- Aggregate metrics can hide poor performance for particular SKUs or forecast horizons.
-- The historical backtest evaluates baseline methods and does not establish that more advanced models would perform better.
-- The generated four-week CSV and the rolling historical backtest serve different purposes and should not be treated as the same evaluation.
+The recent-average method outperformed the other two methods at each of the four forecast horizons in this backtest.
+
+These results apply to the common evaluation set and the tested baseline implementations. They should not be interpreted as proof of performance for new SKUs, promotions, festival periods, or other conditions not separately evaluated.
 
 ## 8. Reorder Suggestions and Inventory Planning
 
-Reorder suggestions combine forecast demand, supplier lead time, safety stock, and current inventory.
+Reorder suggestions combine demand estimates with current inventory and supplier lead-time information. The reorder API should use the formula defined in `API_CONTRACT.md` as the authoritative contract.
 
-The documented safety-stock approach uses:
+The implementation should use live stock values from the application rather than assuming that historical stock values are still current. Forecast demand and stock information serve different purposes: forecasts estimate future demand, while inventory data indicates current availability.
 
-- A service factor of 1.65.
-- Sample standard deviation of recent demand.
-- The square root of supplier lead time.
+Where the contract uses a service factor of 1.65 and sample standard deviation, those values should be applied consistently with the contract's safety-stock and lead-time calculations. The square root of lead time is relevant when calculating safety stock under the corresponding statistical assumptions.
 
-The reorder quantity is intended to be the non-negative difference between the reorder point and current stock, with rounding applied as required by the implementation.
+Reorder quantities must not be negative. Missing lead times, insufficient sales history, and invalid inventory data should be handled explicitly instead of producing misleading recommendations.
 
-**Rationale:** A lead-time demand estimate helps identify stock that may be insufficient before replenishment arrives. Safety stock provides an additional buffer against demand variability.
-
-**Verification required:** Check `API_CONTRACT.md` and the actual reorder implementation for the precise equations, units, rounding behavior, and treatment of missing or invalid lead times. The formula in this document must match the code exactly.
+Forecast and reorder outputs should remain distinct. A demand forecast estimates expected sales, while a reorder suggestion considers the forecast together with stock position, lead time, and the agreed replenishment policy.
 
 ## 9. Configuration and Reproducibility
 
-- Runtime configuration is supplied through environment variables.
-- `.env` is excluded from Git.
-- `.env.example` documents the configuration interface with placeholder values.
-- Database migrations are part of the repository.
-- The `seed_data` command provides initial catalogue and dealer records.
-- Forecast generation is available through the Django management command.
+Configuration should be provided through environment variables where appropriate. The repository should include `.env.example` with placeholder values and setup instructions without exposing real credentials.
 
-The documented setup sequence is:
+The virtual environment should not be committed. Dependency installation and application startup should follow the instructions in the README.
 
-```bash
-python -m pip install -r requirements.txt
-python manage.py migrate --noinput
-python manage.py seed_data
-python manage.py seed_data
-python manage.py runserver
-```
+Database migrations should be included in version control so that a clean environment can reproduce the schema. Seed commands should be safe to run repeatedly.
 
-The database must exist and the environment must be configured before running migrations and seeding.
-
-A clean-clone setup should be considered verified only after the procedure succeeds in a fresh working directory with the documented configuration.
+The project should be tested from a clean setup where practical. This helps identify dependencies on local files, uncommitted configuration, or data that exists only in the developer's environment.
 
 ## 10. Testing and Validation Evidence
 
-The following checks have been observed during development:
+The following checks were performed during development:
 
-- **Django system check:** Passed with no issues.
-- **Forecast CSV validation:** Passed — 160 rows, 40 SKUs, four expected forecast weeks per SKU, and non-negative forecast values.
-- **API smoke test:** Passed 10 of 10 checks.
-- **Four-week backtest:** Completed for all three baselines.
-- **Django test discovery:** `python manage.py test` discovered zero tests.
+- `python manage.py check` completed successfully.
+- The forecast CSV validation confirmed 160 rows, 40 unique SKUs, four forecast dates, and non-negative quantities.
+- `python smoke_test.py --base-url http://127.0.0.1:8000 --track aiml` passed all 10 checks.
+- The historical rolling-origin backtest completed for the three forecasting baselines.
+- `python manage.py test` completed but discovered zero tests.
 
-The smoke test covers core API contract behavior, assistant response shape, and forecast endpoint response shape. It does not fully evaluate the quality of assistant answers, correctness of every tool call, prompt-injection resistance, or future forecasting accuracy.
+The smoke test validates expected API response shapes and basic endpoint behavior. Passing these checks does not prove that all assistant responses are correct, that the forecasting model performs well in every situation, or that the application is secure against every attack.
 
-The zero-test result must not be represented as a passing automated unit-test suite.
-
-Before submission, run:
-
-```bash
-python manage.py check
-python manage.py makemigrations --check --dry-run
-python smoke_test.py --base-url http://127.0.0.1:8000 --track aiml
-python ml/backtest_four_week.py
-git diff --check
-```
-
-The API smoke test requires the application server and configured database to be available.
-
-**Outstanding verification:** Clean-clone setup, seed idempotency in a fresh database, and additional automated tests for important business logic should be completed or clearly reported as limitations.
+Because the Django test command discovered zero tests, automated unit and integration test coverage remains an area for improvement. Dedicated tests should be added for tool argument validation, inventory edge cases, draft-order creation, forecast generation, and reorder calculations.
 
 ## 11. Current Limitations and Future Improvements
 
-The current implementation prioritizes a clear API contract, database-grounded assistant operations, reproducible baseline forecasting, and reorder suggestions.
+The current forecasting implementation is intentionally simple. It provides a reproducible baseline, but it does not explicitly account for trends, promotions, festival effects, stockouts, or intermittent demand.
 
 Potential improvements include:
 
-- Add automated unit and integration tests for the assistant's tool-calling loop and business rules.
-- Evaluate the assistant on representative requests, ambiguous orders, invalid inputs, and malicious catalogue text.
-- Add SKU-level and horizon-level forecast diagnostics.
-- Evaluate promotion and festive-demand features using historical backtesting without future-data leakage.
-- Define a cold-start policy for new SKUs.
-- Evaluate approaches designed for intermittent demand.
-- Measure forecast quality against additional baselines before introducing more complex models.
-- Verify clean-clone setup and seed idempotency in a fresh PostgreSQL database.
+- Evaluate forecasting methods separately for intermittent-demand and high-volume SKUs.
+- Add promotion and festival features when reliable historical information is available.
+- Evaluate new-SKU handling and insufficient-history behavior.
+- Add automated tests for forecasting, inventory calculations, and assistant tool calls.
+- Track forecast errors over time and compare future models against the current baseline.
+- Add clearer handling for missing or inconsistent inventory and supplier data.
+- Expand security tests for malicious instructions embedded in retrieved catalogue content.
+- Verify all reorder calculations against the exact API contract and its expected examples.
+
+These are proposed improvements and should not be treated as already implemented.
 
 ## 12. Implementation References
 
-Add exact source-file and line references before final submission. The following files are starting points to inspect; verify their contents and line numbers against the final commit.
+The following files are relevant to the decisions described above:
 
-- `core/management/commands/generate_forecast.py` — forecast generation.
-- `ml/backtest_four_week.py` — rolling-origin baseline evaluation.
-- `ml/forecast.csv` — generated forecast output.
-- `API_CONTRACT.md` — API behavior and reorder formula.
+- `ml/forecast.csv` — forecast input data.
+- `ml/sales_history.csv` — historical sales data used for forecasting evaluation.
+- `ml/backtest_four_week.py` — rolling-origin historical comparison of forecasting baselines.
+- `core/management/commands/generate_forecast.py` — forecast generation command.
+- `API_CONTRACT.md` — API behavior and reorder calculation contract.
+- `smoke_test.py` — API smoke-test script.
+- `.env.example` — example environment configuration.
 - `README.md` — setup and execution instructions.
-- Assistant endpoint, tool dispatcher, and tool implementation files — locate the actual files in the repository and add their exact paths and line ranges.
-- Model, serializer, and seed-command files — verify the relevant database constraints and business rules before citing them.
-
-Do not add guessed line numbers. Every reference should point to code that directly supports the associated claim.
