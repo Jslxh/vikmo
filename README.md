@@ -267,7 +267,7 @@ See [`DECISIONS.md`](DECISIONS.md) for the design rationale, retrieval and assis
 
 ## Demo Video
 
-**Demo video:** Add the final video URL here after recording and uploading it.
+**Demo video:** https://drive.google.com/file/d/1HF0P6v0Ghq3R25kwLBkqxxjJHXg5XZ4S/view?usp=drive_link
 
 The demonstration should show:
 
